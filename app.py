@@ -8,14 +8,36 @@ import shutil
 import json
 import time
 
-# --- 데이터 관리 클래스 ---
 class DataManager:
     def __init__(self, csv_path='speciesspecies.csv'):
         self.csv_path = csv_path
         self.breed_data = None
-        self.feature_columns = ['Skull_Index', 'Body_Ratio', 'Intelligence_Rank', 'Aggression_Score', 'Maintenance_Score']
+        self.breed_features = ['Skull_Index', 'Body_Ratio', 'trainability', 'Aggression', 'Maintenance_Score']
+
+        self.range = {
+            'age' : 20.0,
+            'gender': 1.0,             
+            'size': 2.0,              
+            'Skull_Index': 46.0,       
+            'Body_Ratio': 0.7,        
+            'trainability': 2.4, 
+            'Aggression': 1.1,   
+            'Maintenance_Score': 7.0   
+        }
         
-        # --- DB 폴더 및 파일 설정 ---
+        self.feature_coefficients = {
+            'age' : 10.0,
+            'gender': 0.7,             
+            'size': 3.0,              
+            'Skull_Index': 1.0,       
+            'Body_Ratio': 1.0,        
+            'trainability': 1.0, 
+            'Aggression': 1.0,   
+            'Maintenance_Score': 1.0   
+        }
+
+        self.mismatch_penalty = 3.0 
+
         self.db_folder = os.path.join(os.getcwd(), 'dog_db')
         self.img_folder = os.path.join(self.db_folder, 'images')
         self.json_path = os.path.join(self.db_folder, 'dog_data.json')
@@ -24,59 +46,42 @@ class DataManager:
             os.makedirs(self.img_folder)
             
         self.registered_dogs = [] 
+        self.breed_map = {}
 
-        # 1. 견종 데이터 로드
         self.load_breed_data()
-        
-        # 견종 벡터 맵 생성
-        if self.normalized_df is not None:
-            self.breed_vec_map = {
-                row['Breed']: row[self.feature_columns].values 
-                for _, row in self.normalized_df.iterrows()
-            }
-        else:
-            self.breed_vec_map = {}
-
-        # 2. 저장된 강아지 데이터 로드
         self.load_registered_dogs()
 
     def load_breed_data(self):
-        """견종 특성 데이터(CSV) 로드 및 정규화"""
         if not os.path.exists(self.csv_path):
-            # CSV가 없어도 실행은 되도록 처리
             self.breed_list = []
-            self.normalized_df = None
-            print(f"경고: {self.csv_path} 파일이 없습니다. 견종 특성 매칭이 제한됩니다.")
+            print(f"경고: {self.csv_path} 파일이 없습니다.")
             return
 
         try:
             df = pd.read_csv(self.csv_path)
-            self.normalized_df = df.copy()
-            for col in self.feature_columns:
-                if col in df.columns:
-                    min_val = df[col].min()
-                    max_val = df[col].max()
-                    if max_val - min_val == 0:
-                        self.normalized_df[col] = 0
-                    else:
-                        self.normalized_df[col] = (df[col] - min_val) / (max_val - min_val)
+            if 'Breed' in df.columns:
+                df['Breed'] = df['Breed'].str.replace('_', ' ').str.lower().str.strip()
+            
+            for col in self.breed_features:
+                if col not in df.columns:
+                    df[col] = 0
                 else:
-                    self.normalized_df[col] = 0 # 컬럼이 없으면 0 처리
+                    df[col] = df[col].fillna(0)
             
             self.breed_data = df
             self.breed_list = sorted(df['Breed'].unique().tolist())
+            
+            self.breed_map = df.set_index('Breed')[self.breed_features].to_dict('index')
             
         except Exception as e:
             messagebox.showerror("Error", f"견종 데이터 로드 실패: {e}")
             self.breed_list = []
 
     def load_registered_dogs(self):
-        """JSON 파일에서 등록된 강아지 목록 로드"""
         if os.path.exists(self.json_path):
             try:
                 with open(self.json_path, 'r', encoding='utf-8') as f:
                     self.registered_dogs = json.load(f)
-                print(f"DB 로드 완료: {len(self.registered_dogs)}마리")
             except Exception as e:
                 print(f"DB 로드 오류: {e}")
                 self.registered_dogs = []
@@ -84,7 +89,6 @@ class DataManager:
             self.registered_dogs = []
 
     def register_dog(self, info, original_image_path):
-        """강아지 등록 프로세스"""
         saved_image_path = None
         if original_image_path and os.path.exists(original_image_path):
             ext = os.path.splitext(original_image_path)[1]
@@ -108,99 +112,84 @@ class DataManager:
             print(f"저장 실패: {e}")
 
     def calculate_matches(self, user_prefs, weights):
-        """매칭 알고리즘 (안전장치 추가됨)"""
         if not self.registered_dogs:
             return []
 
-        try:
-            # 1. 데이터프레임 변환
-            df = pd.DataFrame(self.registered_dogs)
+        results = []
 
-            # [핵심 수정] 데이터 전처리 (NaN 방지)
-            # 데이터가 비어있으면 기본값으로 채웁니다.
-            df['age'] = pd.to_numeric(df['age'], errors='coerce').fillna(5)
-            df['gender'] = pd.to_numeric(df['gender'], errors='coerce').fillna(0)
-            df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(1)
-            df['breed'] = df['breed'].astype(str).fillna("Unknown")
+        target_breed_name = str(user_prefs.get('breed', '')).lower().strip()
+        target_breed_stats = self.breed_map.get(target_breed_name, {k: 0 for k in self.breed_features})
+        
+        max_sq_sum = 0.0
+        max_sq_sum += weights['age'] * self.feature_coefficients['age'] * (1.0 ** 2)
+        max_sq_sum += weights['gender'] * self.feature_coefficients['gender'] * (1.0 ** 2)
+        max_sq_sum += weights['size'] * self.feature_coefficients['size'] * (1.0 ** 2)
+        
+        for feature in self.breed_features:
+            coeff = self.feature_coefficients.get(feature, 1.0)
+            max_sq_sum += weights['breed'] * coeff * (1.0 ** 2)
+        
 
-            # --- 문자열 정규화 ---
-            target_breed_clean = str(user_prefs['breed']).lower().replace('_', '').replace(' ', '').replace('-', '')
-            db_breeds_clean = df['breed'].str.lower().str.replace('_', '').str.replace(' ', '').str.replace('-', '')
-            
-            is_name_mismatch = (db_breeds_clean != target_breed_clean).astype(float)
+        max_sq_sum += self.mismatch_penalty 
+        
+        max_distance = np.sqrt(max_sq_sum)
+        if max_distance == 0: max_distance = 1.0
 
-            # 2. 타겟 값 설정
-            target_age = user_prefs['age'] / 20.0
-            target_gender = user_prefs['gender']
-            target_size = user_prefs['size'] / 2.0
-            
-            # CSV에 없는 견종일 경우 0벡터 사용
-            target_breed_vec = self.breed_vec_map.get(user_prefs['breed'], np.zeros(len(self.feature_columns)))
-
-            # 3. 거리 계산
-            age_dist_sq = (target_age - (df['age'] / 20.0)).abs() ** 2
-            gender_dist_sq = (target_gender - df['gender']).abs() ** 2
-            size_dist_sq = (target_size - (df['size'] / 2.0)).abs() ** 2
-
-            # 견종 특성 거리 계산 함수
-            def get_breed_dist_sq(breed_name):
-                # breed_name이 맵에 없으면 0 반환 (오류 방지)
-                dog_vec = self.breed_vec_map.get(breed_name, np.zeros(len(self.feature_columns)))
-                return np.sum((target_breed_vec - dog_vec) ** 2)
-            
-            # map 적용
-            breed_feature_dist_sq = df['breed'].apply(get_breed_dist_sq)
-
-            # 4. 페널티 적용
-            PENALTY_FACTOR = 1.5
-            name_penalty_sq = (is_name_mismatch * PENALTY_FACTOR) ** 2
-
-            # 5. 총 거리 합산
-            total_dist_sq = (
-                (weights['age'] * age_dist_sq) +
-                (weights['gender'] * gender_dist_sq) +
-                (weights['size'] * size_dist_sq) +
-                (weights['breed'] * breed_feature_dist_sq) +
-                (weights['breed'] * name_penalty_sq)
-            )
-            
-            final_dist = np.sqrt(total_dist_sq)
-
-            # 6. 점수 환산
-            max_possible_dist = np.sqrt(
-                weights['age'] + 
-                weights['gender'] + 
-                weights['size'] + 
-                weights['breed'] * 5 + 
-                weights['breed'] * (PENALTY_FACTOR ** 2)
-            )
-
-            if max_possible_dist == 0:
-                df['score'] = 100
-            else:
-                df['score'] = (100 - (final_dist / max_possible_dist * 100)).clip(lower=0)
-
-            # 7. 정렬 및 반환
-            # score가 NaN인 경우를 대비해 0으로 채움
-            df['score'] = df['score'].fillna(0)
-            
-            top_results_df = df.nlargest(50, 'score')
-            
-            results = []
-            for _, row in top_results_df.iterrows():
-                results.append({
-                    'dog': row.to_dict(),
-                    'score': round(row['score'], 1)
-                })
+        for dog in self.registered_dogs:
+            try:
+                dog_age = float(dog.get('age', 0))
+                age_diff = user_prefs['age'] - dog_age
                 
-            return results
+                dog_gender = int(dog.get('gender', 0))
+                gender_diff = user_prefs['gender'] - dog_gender
+                
+                dog_size = int(dog.get('size', 0))
+                size_diff = user_prefs['size'] - dog_size
 
-        except Exception as e:
-            print(f"매칭 알고리즘 오류: {e}")
-            # 오류 발생 시 빈 리스트 대신 오류 메시지를 담은 더미 데이터라도 반환하거나 빈 리스트 반환
-            return []
+                dog_breed_name = str(dog.get('breed', '')).lower().strip()
+                dog_breed_stats = self.breed_map.get(dog_breed_name, {k: 0 for k in self.breed_features})
 
-# --- 커스텀 위젯 ---
+                weighted_sum_sq = 0.0
+                weighted_sum_sq += weights['age'] * self.feature_coefficients['age'] * ((age_diff/self.range['age']) ** 2)
+                weighted_sum_sq += weights['gender'] * self.feature_coefficients['gender'] * ((gender_diff/self.range['gender']) ** 2)
+                weighted_sum_sq += weights['size'] * self.feature_coefficients['size'] * ((size_diff/self.range['size']) ** 2)
+
+                for feature in self.breed_features:
+                    target_val = target_breed_stats.get(feature, 0)
+                    dog_val = dog_breed_stats.get(feature, 0)
+                    feat_diff = target_val - dog_val
+                    
+                    coeff = self.feature_coefficients.get(feature, 1.0)
+                    rang = self.range.get(feature, 1.0)
+                    
+                    weighted_sum_sq += weights['breed'] * coeff * ((feat_diff/rang) ** 2)
+
+                if target_breed_name != dog_breed_name:
+                    weighted_sum_sq += self.mismatch_penalty
+
+                final_distance = np.sqrt(weighted_sum_sq)
+                
+                ratio = final_distance / max_distance
+
+                if ratio > 1.0: 
+                    ratio = 1.0
+                
+                score = (1.0 - ratio) * 100
+                
+                results.append({
+                    'dog': dog,
+                    'score': round(score, 1),
+                    'raw_dist': round(final_distance, 2)
+                })
+
+            except Exception as e:
+                print(f"개별 강아지 계산 오류 ({dog.get('name')}): {e}")
+                continue
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        
+        return results
+
 class SearchableCombobox(ttk.Combobox):
     def __init__(self, master=None, all_values=None, **kwargs):
         super().__init__(master, **kwargs)
@@ -218,8 +207,6 @@ class SearchableCombobox(ttk.Combobox):
                 if value.lower() in item.lower():
                     data.append(item)
             self['values'] = data
-
-# --- UI 페이지 클래스들 ---
 
 class MainPage(tk.Frame):
     def __init__(self, master, controller):
@@ -326,11 +313,6 @@ class RegisterPage(tk.Frame):
             age = int(age_str)
             size_str = self.combo_size.get()
             
-            # 목록에 없어도 등록은 가능하게 하거나 경고 (여기서는 경고)
-            if self.controller.data_manager.breed_list and breed not in self.controller.data_manager.breed_list:
-                # 하지만 강제하지는 않음 (유연성)
-                pass
-
             size_map = {"소형": 0, "중형": 1, "대형": 2}
             
             dog_info = {
@@ -409,7 +391,7 @@ class MatchPage(tk.Frame):
 
         tk.Label(weight_frame, text="견종 중요도:").grid(row=3, column=0)
         self.scale_breed = tk.Scale(weight_frame, from_=1, to=10, orient="horizontal", length=100)
-        self.scale_breed.set(8)
+        self.scale_breed.set(5)
         self.scale_breed.grid(row=3, column=1)
 
         btn_search = tk.Button(self, text="결과 보기 (Result)", command=self.search_matches, bg="pink", width=20, height=2)
@@ -431,7 +413,6 @@ class MatchPage(tk.Frame):
             age_val = int(age_val_str)
             
             breed_val = self.combo_breed.get()
-            # CSV가 없거나 로드 실패해도 검색은 되도록 (대신 견종매칭 정확도 떨어짐)
             
             size_map = {"소형": 0, "중형": 1, "대형": 2}
             
@@ -448,6 +429,8 @@ class MatchPage(tk.Frame):
                 'size': self.scale_size.get(),
                 'breed': self.scale_breed.get()
             }
+
+            weights = {key: value ** 2 for key, value in weights.items()}
             
             results = self.controller.data_manager.calculate_matches(prefs, weights)
             self.controller.show_results(results)
@@ -458,7 +441,6 @@ class MatchPage(tk.Frame):
             messagebox.showerror("오류", f"검색 중 오류 발생: {e}")
 
 
-# --- ResultPage (화면 갱신 수정됨) ---
 class ResultPage(tk.Frame):
     def __init__(self, master, controller):
         super().__init__(master)
@@ -492,7 +474,6 @@ class ResultPage(tk.Frame):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
 
     def display_results(self, results):
-        # 기존 위젯 삭제
         for widget in self.frame.winfo_children():
             widget.destroy()
         self.photo_refs = []
@@ -507,7 +488,6 @@ class ResultPage(tk.Frame):
             dog = item['dog']
             score = item['score']
             
-            # 데이터 타입 안전 처리
             try:
                 gender_str = "암컷" if int(dog.get('gender', 0)) == 1 else "수컷"
                 size_val = int(dog.get('size', 0))
@@ -519,7 +499,6 @@ class ResultPage(tk.Frame):
             card = tk.Frame(self.frame, bd=2, relief="groove", bg="#f0f0f0")
             card.pack(fill="x", padx=10, pady=5)
             
-            # 이미지
             img_label = tk.Label(card, bg="#dddddd", width=100, height=100, text="No Image")
             img_label.pack(side="left", padx=10, pady=5)
 
@@ -534,18 +513,17 @@ class ResultPage(tk.Frame):
                 except Exception:
                     pass
             
-            info_text = f"[{idx+1}위] {score}점\n\n이름: {dog.get('name', 'Unknown')}\n견종: {dog.get('breed', 'Unknown')}\n나이: {dog.get('age', '?')}살 | {gender_str} | {size_str}"
+            info_text = f"[{idx+1}위] 매칭 점수: {score}점\n\n이름: {dog.get('name', 'Unknown')}\n견종: {dog.get('breed', 'Unknown')}\n나이: {dog.get('age', '?')}살 | {gender_str} | {size_str}"
             text_label = tk.Label(card, text=info_text, justify="left", font=("맑은 고딕", 11), bg="#f0f0f0")
             text_label.pack(side="left", padx=10)
 
-        # [중요] 화면 강제 갱신
         self.frame.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
 class DogMatchingApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("유기견 매칭 시스템 (DB Ver - Fixed)")
+        self.title("유기견 매칭 시스템 (Updated)")
         self.geometry("600x650")
         
         self.data_manager = DataManager('speciesspecies.csv')
